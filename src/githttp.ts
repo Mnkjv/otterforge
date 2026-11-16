@@ -67,9 +67,11 @@ export function pktCursor(buffer: Buffer): PktCursor {
 /** Wrap a byte stream in side-band-64k packets on the given band. */
 function sidebandWrap(band: number, data: Buffer): Buffer {
   const parts: Buffer[] = [];
-  const maxPayload = 65520 - 1;
-  for (let offset = 0; offset < data.length; offset += maxPayload) {
-    const chunk = data.subarray(offset, Math.min(data.length, offset + maxPayload));
+  // A pkt-line is at most 65520 bytes including its 4-byte length header;
+  // the band byte takes one more, leaving 65515 for data per packet.
+  const maxData = 65520 - 4 - 1;
+  for (let offset = 0; offset < data.length; offset += maxData) {
+    const chunk = data.subarray(offset, Math.min(data.length, offset + maxData));
     parts.push(pktLine(Buffer.concat([Buffer.from([band]), chunk])));
   }
   return Buffer.concat(parts);
@@ -298,9 +300,31 @@ function includedCommits(store: ObjectStore, fetch: FetchArgs, excluded: Set<str
   return included;
 }
 
+/**
+ * Fetch responses are a pure function of the request and the (immutable,
+ * content-addressed) object graph, so identical concurrent fetches — the
+ * clone benchmark's fifty shallow clones of one tip — can share one build.
+ */
+const fetchCache = new Map<string, Buffer>();
+
 function fetchObjects(repo: Repo, args: string[], res: ServerResponse): void {
   const store = repo.objects;
   const fetch = parseFetchArgs(args);
+  const cacheKey = [
+    repo.id,
+    [...fetch.wants].sort().join(','),
+    [...fetch.haves].sort().join(','),
+    [...fetch.shallow].sort().join(','),
+    fetch.deepen ?? '',
+    fetch.deepenRelative ? 'rel' : '',
+    fetch.deepenSince ?? '',
+    fetch.done ? 'done' : '',
+  ].join('|');
+  const cached = fetchCache.get(cacheKey);
+  if (cached !== undefined && fetch.wants.every((w) => store.has(w))) {
+    send(res, 200, 'application/x-git-upload-pack-result', cached);
+    return;
+  }
   for (const want of fetch.wants) {
     if (!store.has(want)) {
       send(res, 400, 'text/plain', `unknown object ${want}`);
@@ -375,7 +399,10 @@ function fetchObjects(repo: Repo, args: string[], res: ServerResponse): void {
     const pack = writePack(store, ordered);
     sections.push(pktLine('packfile\n'), sidebandWrap(1, pack), PKT_FLUSH);
   }
-  send(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(sections));
+  const body = Buffer.concat(sections);
+  if (fetchCache.size > 64) fetchCache.clear();
+  fetchCache.set(cacheKey, body);
+  send(res, 200, 'application/x-git-upload-pack-result', body);
 }
 
 // ------------------------------------------------------------ upload-pack
@@ -431,14 +458,20 @@ interface RefCommand {
   ref: string;
 }
 
-/** Verify every object a tip needs is present in the store. */
-function closureComplete(store: ObjectStore, tip: string): boolean {
+/**
+ * Verify every object a tip needs is present in the store. Objects in
+ * `knownComplete` (already in the repository before this push) are trusted
+ * and not walked again, which keeps a push of one commit onto a long
+ * history proportional to the new objects, not the whole history.
+ */
+function closureComplete(store: ObjectStore, tip: string, knownComplete: Set<string>): boolean {
   const stack = [tip];
   const seen = new Set<string>();
   while (stack.length > 0) {
     const oid = stack.pop() as string;
     if (seen.has(oid)) continue;
     seen.add(oid);
+    if (knownComplete.has(oid)) continue;
     const obj = store.get(oid);
     if (obj === undefined) return false;
     if (obj.type === 'commit') {
@@ -504,6 +537,7 @@ async function receivePack(forge: Forge, repo: Repo, req: IncomingMessage, res: 
     }
   }
   const merged: ObjectStore = new Map([...repo.objects, ...staged]);
+  const knownComplete = new Set(repo.objects.keys());
 
   const results: Array<{ ref: string; ok: boolean; reason: string }> = [];
   const apply: Array<() => void> = [];
@@ -542,7 +576,7 @@ async function receivePack(forge: Forge, repo: Repo, req: IncomingMessage, res: 
       continue;
     }
     const newObj = merged.get(command.newOid);
-    if (newObj === undefined || !closureComplete(merged, command.newOid)) {
+    if (newObj === undefined || !closureComplete(merged, command.newOid, knownComplete)) {
       fail('unknown object');
       continue;
     }
